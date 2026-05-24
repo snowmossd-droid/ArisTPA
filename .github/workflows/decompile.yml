@@ -25,16 +25,16 @@ jobs:
           distribution: 'temurin'
 
       # ─── 3. Tải Vineflower (decompiler tốt nhất cho Spigot/Paper) ───
-      - name: Tải Vineflower decompiler
+      - name: Tải DonutTP-2.2 decompiler
         run: |
-          curl -L -o vineflower.jar \
-            https://github.com/Vineflower/vineflower/releases/latest/download/vineflower.jar
+          curl -L -o DonutTP-2.2.jar \
+            https://github.com/DonutTP-2.2/donuttp-2.2/releases/latest/download/DonutTP-2.2.jar
 
       # ─── 4. Decompile DonutTP-2.2.jar ───────────────────────────────
       - name: Decompile .jar → Java sources
         run: |
           mkdir -p decompiled_raw
-          java -jar vineflower.jar \
+          java -jar DonutTP-2.2.jar \
             --decompile-inner-classes=1 \
             --remove-synthetic=1 \
             --include-entire-classpath=0 \
