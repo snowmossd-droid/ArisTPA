@@ -1,23 +1,213 @@
+name: Decompile DonutTP-2.2.jar
 
-## Những thay đổi chính:
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'DonutTP-2.2.jar'
 
-1. **✅ Đã sửa tên file** thành `DonutTP-2.2.jar` (đúng theo yêu cầu)
+jobs:
+  decompile:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
-2. **🛡️ Thêm kiểm tra** trước khi decompile:
-   - Kiểm tra file vineflower.jar có tải thành công không
-   - Kiểm tra file DonutTP-2.2.jar có tồn tại không
-   - Kiểm tra output có được tạo không
+    steps:
+      # ─── 1. Checkout repo ───────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
 
-3. **🐛 Sửa lỗi tiềm ẩn**:
-   - Thêm `continue-on-error: true` cho bước compile (không fail workflow)
-   - Sửa cách tạo pom.xml để tránh lỗi heredoc
+      # ─── 2. Java 17 (tương thích Paper 1.20+) ───────────────────────
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
 
-4. **📦 Paper 1.20.4** - dùng version ổn định thay vì snapshot
+      # ─── 3. Tải Vineflower decompiler ───────────────────────────────
+      - name: Tải Vineflower decompiler
+        run: |
+          echo "Đang tải Vineflower..."
+          curl -L -o vineflower.jar \
+            https://github.com/Vineflower/vineflower/releases/latest/download/vineflower.jar
+          
+          # Kiểm tra file tải về có hợp lệ không
+          if [ ! -f vineflower.jar ]; then
+            echo "❌ Không tải được vineflower.jar"
+            exit 1
+          fi
+          
+          # Kiểm tra kích thước file (không được quá nhỏ)
+          SIZE=$(stat -c%s vineflower.jar)
+          if [ $SIZE -lt 1000000 ]; then
+            echo "❌ File vineflower.jar quá nhỏ ($SIZE bytes) - có thể bị lỗi tải"
+            cat vineflower.jar  # In nội dung để debug
+            exit 1
+          fi
+          
+          echo "✅ Đã tải vineflower.jar thành công ($SIZE bytes)"
 
-## Cách dùng:
+      # ─── 4. Decompile DonutTP-2.2.jar ───────────────────────────────
+      - name: Decompile .jar → Java sources
+        run: |
+          # Kiểm tra file cần decompile có tồn tại không
+          if [ ! -f "DonutTP-2.2.jar" ]; then
+            echo "❌ Không tìm thấy DonutTP-2.2.jar"
+            ls -la
+            exit 1
+          fi
+          
+          echo "Đang giải mã DonutTP-2.2.jar..."
+          mkdir -p decompiled_raw
+          java -jar vineflower.jar \
+            --decompile-inner-classes=1 \
+            --remove-synthetic=1 \
+            --include-entire-classpath=0 \
+            DonutTP-2.2.jar decompiled_raw/
+          
+          # Kiểm tra kết quả
+          if [ ! -d "decompiled_raw" ] || [ -z "$(ls -A decompiled_raw)" ]; then
+            echo "❌ Giải mã thất bại - không có output"
+            exit 1
+          fi
+          
+          echo "✅ Giải mã thành công"
+          echo "Số file Java đã giải mã: $(find decompiled_raw -name "*.java" | wc -l)"
 
-1. **Commit file này** vào `.github/workflows/decompile.yml`
-2. **Push DonutTP-2.2.jar** lên root của repo
-3. Workflow sẽ tự chạy và tạo branch `decompiled/donuttp-2.2` chứa source code đã giải mã
+      # ─── 5. Tổ chức sang cấu trúc Maven src/main/java ───────────────
+      - name: Tổ chức cấu trúc Maven
+        run: |
+          mkdir -p src/main/java
+          mkdir -p src/main/resources
 
-Nếu vẫn gặp lỗi "Invalid or corrupt jarfile vineflower.jar", có thể do mạng chặn GitHub - hãy thử dùng mirror hoặc tự upload vineflower.jar lên repo.
+          # Copy toàn bộ .java vào src/main/java
+          find decompiled_raw -name "*.java" | while read f; do
+            rel=$(realpath --relative-to=decompiled_raw "$f")
+            dest="src/main/java/$rel"
+            mkdir -p "$(dirname "$dest")"
+            cp "$f" "$dest"
+          done
+
+          # Chuyển plugin.yml và config.yml sang resources
+          find decompiled_raw -name "plugin.yml" -exec cp {} src/main/resources/ \;
+          find decompiled_raw -name "config.yml"  -exec cp {} src/main/resources/ \;
+          find decompiled_raw -name "*.yml" ! -name "plugin.yml" ! -name "config.yml" \
+            -exec cp {} src/main/resources/ \;
+          
+          echo "✅ Đã tổ chức source vào src/main/java"
+
+      # ─── 6. Detect package gốc của DonutTP ──────────────────────────
+      - name: Detect root package
+        id: detect_pkg
+        run: |
+          PKG=$(find src/main/java -name "*.java" | head -10 | \
+                xargs grep -h "^package " 2>/dev/null | \
+                sed 's/package //;s/;//' | \
+                awk -F. '{print $1"."$2}' | \
+                sort | uniq -c | sort -rn | head -1 | awk '{print $2}')
+          
+          if [ -z "$PKG" ]; then
+            PKG="com.donuttp"
+          fi
+          
+          echo "package=$PKG" >> $GITHUB_OUTPUT
+          echo "✅ Detected package: $PKG"
+
+      # ─── 7. Generate pom.xml ────────────────────────────────────────
+      - name: Generate pom.xml
+        run: |
+          PKG="${{ steps.detect_pkg.outputs.package }}"
+
+          cat > pom.xml << 'POMEOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+                     http://maven.apache.org/xsd/maven-4.0.0.xsd">
+            <modelVersion>4.0.0</modelVersion>
+
+            <groupId>POMEOF
+          echo "          ${PKG}" >> pom.xml
+          cat >> pom.xml << 'POMEOF'
+            </groupId>
+            <artifactId>DonutTP</artifactId>
+            <version>2.2-decompiled</version>
+            <packaging>jar</packaging>
+
+            <properties>
+              <java.version>17</java.version>
+              <maven.compiler.source>17</maven.compiler.source>
+              <maven.compiler.target>17</maven.compiler.target>
+              <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+            </properties>
+
+            <repositories>
+              <repository>
+                <id>papermc</id>
+                <url>https://repo.papermc.io/repository/maven-public/</url>
+              </repository>
+            </repositories>
+
+            <dependencies>
+              <dependency>
+                <groupId>io.papermc.paper</groupId>
+                <artifactId>paper-api</artifactId>
+                <version>1.20.4-R0.1-SNAPSHOT</version>
+                <scope>provided</scope>
+              </dependency>
+            </dependencies>
+
+            <build>
+              <plugins>
+                <plugin>
+                  <groupId>org.apache.maven.plugins</groupId>
+                  <artifactId>maven-compiler-plugin</artifactId>
+                  <version>3.11.0</version>
+                  <configuration>
+                    <source>17</source>
+                    <target>17</target>
+                  </configuration>
+                </plugin>
+              </plugins>
+            </build>
+          </project>
+          POMEOF
+          
+          echo "✅ Đã tạo pom.xml"
+
+      # ─── 8. Thử compile ─────────────────────────────────────────────
+      - name: Compile check
+        continue-on-error: true
+        run: |
+          mvn compile 2>compile-errors.txt | tee compile-output.txt || true
+          
+          ERROR_COUNT=$(grep -c "\[ERROR\]" compile-errors.txt 2>/dev/null || echo "0")
+          echo "📊 Tổng số lỗi: $ERROR_COUNT"
+          
+          if [ $ERROR_COUNT -gt 0 ]; then
+            echo ""
+            echo "=========================================="
+            echo "🔴 TOP 50 LỖI COMPILE:"
+            echo "=========================================="
+            grep "\[ERROR\]" compile-errors.txt | head -50
+          fi
+
+      # ─── 9. Tạo PORTING_NOTES.md ────────────────────────────────────
+      - name: Tạo PORTING_NOTES.md
+        run: |
+          cat > PORTING_NOTES.md << 'NOTEEOF'
+          # DonutTP 2.2 - Hướng dẫn Porting
+
+          ## 🔧 Các lỗi thường gặp khi port lên Paper 1.20+
+
+          ### 1. API đã thay đổi
+          - `ChatColor` → dùng `net.kyori.adventure.text.Component`
+          - `Player.sendMessage(String)` → `Player.sendMessage(Component)`
+          - `Bukkit.getOnlinePlayers()` → trả về `Collection`
+
+          ### 2. Sửa lỗi compile phổ biến
+          Xem file `compile-errors.txt` để biết chi tiết lỗi
+
+          ### 3. Build lại sau khi fix
+          ```bash
+          mvn clean package
