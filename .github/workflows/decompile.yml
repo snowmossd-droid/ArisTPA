@@ -1,0 +1,205 @@
+name: Decompile DonutTP-2.2.jar
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'DonutTP-2.2.jar'
+
+jobs:
+  decompile:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      # ─── 1. Checkout repo ───────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ─── 2. Java 17 (tương thích Paper 1.20+) ───────────────────────
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      # ─── 3. Tải Vineflower (decompiler tốt nhất cho Spigot/Paper) ───
+      - name: Tải Vineflower decompiler
+        run: |
+          curl -L -o vineflower.jar \
+            https://github.com/Vineflower/vineflower/releases/latest/download/vineflower.jar
+
+      # ─── 4. Decompile DonutTP-2.2.jar ───────────────────────────────
+      - name: Decompile .jar → Java sources
+        run: |
+          mkdir -p decompiled_raw
+          java -jar vineflower.jar \
+            --decompile-inner-classes=1 \
+            --remove-synthetic=1 \
+            --include-entire-classpath=0 \
+            DonutTP-2.2.jar decompiled_raw/
+
+      # ─── 5. Tổ chức sang cấu trúc Maven src/main/java ───────────────
+      - name: Tổ chức cấu trúc Maven
+        run: |
+          mkdir -p src/main/java
+          mkdir -p src/main/resources
+
+          # Copy toàn bộ .java vào src/main/java
+          find decompiled_raw -name "*.java" | while read f; do
+            rel=$(realpath --relative-to=decompiled_raw "$f")
+            dest="src/main/java/$rel"
+            mkdir -p "$(dirname "$dest")"
+            cp "$f" "$dest"
+          done
+
+          # Chuyển plugin.yml và config.yml sang resources
+          find decompiled_raw -name "plugin.yml" -exec cp {} src/main/resources/ \;
+          find decompiled_raw -name "config.yml"  -exec cp {} src/main/resources/ \;
+          find decompiled_raw -name "*.yml" ! -name "plugin.yml" ! -name "config.yml" \
+            -exec cp {} src/main/resources/ \;
+
+      # ─── 6. Detect package gốc của DonutTP ──────────────────────────
+      - name: Detect root package
+        id: detect_pkg
+        run: |
+          PKG=$(find src/main/java -name "*.java" | head -5 | \
+                xargs grep -h "^package " 2>/dev/null | \
+                sed 's/package //;s/;//' | \
+                awk -F. '{print $1"."$2"."$3}' | \
+                sort | uniq -c | sort -rn | head -1 | awk '{print $2}')
+          echo "package=$PKG" >> $GITHUB_OUTPUT
+          echo "Detected package: $PKG"
+
+      # ─── 7. Generate pom.xml với Paper API mới ──────────────────────
+      - name: Generate pom.xml (Paper 1.21)
+        run: |
+          PKG="${{ steps.detect_pkg.outputs.package }}"
+          [ -z "$PKG" ] && PKG="com.example.donuttp"
+
+          cat > pom.xml << POMEOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+                     http://maven.apache.org/xsd/maven-4.0.0.xsd">
+            <modelVersion>4.0.0</modelVersion>
+
+            <!-- TODO: đổi groupId/artifactId theo package gốc -->
+            <groupId>${PKG}</groupId>
+            <artifactId>DonutTP</artifactId>
+            <version>2.2-decompiled</version>
+            <packaging>jar</packaging>
+
+            <properties>
+              <java.version>17</java.version>
+              <maven.compiler.source>17</maven.compiler.source>
+              <maven.compiler.target>17</maven.compiler.target>
+              <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+            </properties>
+
+            <repositories>
+              <repository>
+                <id>papermc</id>
+                <url>https://repo.papermc.io/repository/maven-public/</url>
+              </repository>
+            </repositories>
+
+            <dependencies>
+              <!-- Paper API 1.21 — đổi version tuỳ server target -->
+              <dependency>
+                <groupId>io.papermc.paper</groupId>
+                <artifactId>paper-api</artifactId>
+                <version>1.21.1-R0.1-SNAPSHOT</version>
+                <scope>provided</scope>
+              </dependency>
+            </dependencies>
+
+            <build>
+              <plugins>
+                <plugin>
+                  <groupId>org.apache.maven.plugins</groupId>
+                  <artifactId>maven-shade-plugin</artifactId>
+                  <version>3.5.1</version>
+                  <executions>
+                    <execution>
+                      <phase>package</phase>
+                      <goals><goal>shade</goal></goals>
+                    </execution>
+                  </executions>
+                </plugin>
+              </plugins>
+            </build>
+          </project>
+          POMEOF
+
+      # ─── 8. Thử compile — ghi lỗi ra file để xem sau ────────────────
+      - name: Compile check (ghi lỗi ra compile-errors.txt)
+        run: |
+          mvn compile -q 2>compile-errors.txt || true
+          ERRORS=$(wc -l < compile-errors.txt)
+          echo "Tổng lỗi compile: $ERRORS dòng"
+          if [ "$ERRORS" -gt 0 ]; then
+            echo "--- TOP 40 LỖI ---"
+            head -40 compile-errors.txt
+          fi
+
+      # ─── 9. Tạo PORTING_NOTES.md — gợi ý fix theo lỗi thường gặp ───
+      - name: Tạo PORTING_NOTES.md
+        run: |
+          cat > PORTING_NOTES.md << 'NOTEEOF'
+          # DonutTP 2.2 — Porting Notes
+
+          ## Các lỗi thường gặp khi port lên Paper 1.20+
+
+          ### 1. API đã bị deprecated / xoá
+          - `org.bukkit.ChatColor` → dùng `net.kyori.adventure.text.Component`
+          - `Player.sendMessage(String)` → `Player.sendMessage(Component)`
+          - `ItemMeta.setDisplayName(String)` → `ItemMeta.displayName(Component)`
+          - `Bukkit.getOnlinePlayers()` → trả về `Collection`, không phải `Player[]`
+
+          ### 2. Teleport API thay đổi (liên quan trực tiếp đến DonutTP)
+          - `Player.teleport(Location)` vẫn hoạt động nhưng async teleport
+            nên dùng `Player.teleportAsync(Location)` (Paper only)
+          - Warmup delay nên dùng `BukkitRunnable` hoặc `Scheduler` mới của Folia
+
+          ### 3. Event changes
+          - `PlayerMoveEvent` — kiểm tra lại các field đã đổi
+          - `PlayerTeleportEvent.TeleportCause` — một số enum mới thêm
+
+          ### 4. NMS (nếu có)
+          - Nếu DonutTP dùng NMS, cần remap lại với Mojang mappings
+          - Kiểm tra: `import net.minecraft.server.` trong src/main/java
+
+          ## Lệnh build sau khi fix
+          ```bash
+          mvn clean package -DskipTests
+          # output: target/DonutTP-2.2-decompiled.jar
+          ```
+          NOTEEOF
+
+      # ─── 10. Commit toàn bộ lên branch decompiled/donuttp-2.2 ───────
+      - name: Commit source lên branch mới
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b decompiled/donuttp-2.2 2>/dev/null || \
+            git checkout decompiled/donuttp-2.2
+          git add src/ pom.xml PORTING_NOTES.md
+          [ -s compile-errors.txt ] && git add compile-errors.txt
+          git commit -m "chore: decompile DonutTP-2.2.jar → src/main/java"
+          git push origin decompiled/donuttp-2.2 --force
+
+      # ─── 11. Upload artifact để download trực tiếp ──────────────────
+      - name: Upload src artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DonutTP-2.2-src
+          path: |
+            src/
+            pom.xml
+            PORTING_NOTES.md
+            compile-errors.txt
+          retention-days: 30
+          
